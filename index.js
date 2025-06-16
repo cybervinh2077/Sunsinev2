@@ -13,53 +13,11 @@ const {
     checkOverdueTasks,
     initializeOverdueColumn,
     logCompletionToSheet3,
-    optimizeMemory
-} = require('./taskManager');
-
-// Import memory optimization variables from taskManager
-const {
-    MEMORY_THRESHOLD,
-    MEMORY_WARNING_THRESHOLD,
-    CACHE_CLEANUP_INTERVAL,
-    CACHE_TTL,
-    memoryCache,
-    lastCleanup
+    addTask
 } = require('./taskManager');
 
 console.log('[DEBUG] logCompletionToSheet3 type at startup:', typeof logCompletionToSheet3);
 const { readSheet, updateSheet } = require('./googleSheets');
-
-// Enable garbage collection
-if (process.env.NODE_ENV === 'production') {
-    try {
-        const v8 = require('v8');
-        v8.setFlagsFromString('--expose_gc');
-        global.gc = require('vm').runInNewContext('gc');
-    } catch (e) {
-        logger.warn('Could not enable garbage collection:', e);
-    }
-}
-
-// Memory monitoring interval (5 minutes)
-const MEMORY_CHECK_INTERVAL = 5 * 60 * 1000;
-let lastMemoryCheck = Date.now();
-
-// Function to check and log memory usage
-function checkMemoryUsage() {
-    const resources = getSystemResources();
-    const memoryUsage = parseFloat(resources.memoryUsage);
-
-    if (memoryUsage > 70) {
-        logger.warn('High memory usage detected:', {
-            memoryUsage: resources.memoryUsage,
-            heapUsed: resources.heapUsed,
-            heapTotal: resources.heapTotal
-        });
-
-        // Trigger memory optimization
-        optimizeMemory();
-    }
-}
 
 // Tutorial content
 const tutorialContent = {
@@ -171,15 +129,6 @@ client.once('ready', async() => {
         lastCompletions = await fetchCompletions();
         logger.info('Initial completions loaded:', lastCompletions);
 
-        // Schedule memory checks
-        setInterval(() => {
-            const now = Date.now();
-            if (now - lastMemoryCheck >= MEMORY_CHECK_INTERVAL) {
-                checkMemoryUsage();
-                lastMemoryCheck = now;
-            }
-        }, 60 * 1000); // Check every minute
-
         // Schedule tasks
         cron.schedule('*/10 * * * *', async() => {
             try {
@@ -187,9 +136,6 @@ client.once('ready', async() => {
                 await postTaskSummary(client);
                 await checkOverdueTasks(client);
                 await initializeOverdueColumn();
-
-                // Check memory after heavy operations
-                checkMemoryUsage();
             } catch (error) {
                 logger.error('Error in scheduled task:', error);
             }
@@ -317,9 +263,11 @@ client.on('messageCreate', async(message) => {
 
             case 'stats':
                 const completions = await fetchCompletions();
+                logger.info('Stats - Fetched completions:', completions);
                 const user = message.author.tag;
-                const userData = completions[user] || { completed: 0, overdue: 0 };
-                const completed = userData.completed;
+                const userData = completions[user] || { count: 0, overdue: 0 };
+                logger.info('Stats - User data:', userData, 'for user:', user);
+                const completed = userData.count;
                 const overdue = userData.overdue;
                 let feedback = '';
                 if (completed > overdue) {
@@ -355,7 +303,9 @@ client.on('messageCreate', async(message) => {
 
             case 'tasks':
                 const tasks = await fetchTasks();
+                logger.info('Fetched tasks:', tasks);
                 const userTasks = tasks.filter(t => t.username === message.author.tag);
+                logger.info('Filtered userTasks:', userTasks, 'for user:', message.author.tag);
 
                 if (userTasks.length) {
                     let reply = '**📋 Danh Sách Nhiệm Vụ Của Mày Nè:**\n';
@@ -378,8 +328,8 @@ client.on('messageCreate', async(message) => {
 
                     // Update Sheet 2 (completion count)
                     const completions = await fetchCompletions();
-                    const userData = completions[message.author.tag] || { completed: 0, overdue: 0 };
-                    const currentCount = userData.completed;
+                    const userData = completions[message.author.tag] || { count: 0, overdue: 0 };
+                    const currentCount = userData.count;
                     const overdueCount = userData.overdue;
                     await updateSheet(
                         process.env.GOOGLE_SHEET_2_ID,
@@ -431,6 +381,10 @@ client.on('messageCreate', async(message) => {
                     // Fetch completions data
                     const completions = await fetchCompletions();
                     logger.info('Fetched completions:', completions);
+                    // Thêm log chi tiết từng user
+                    Object.entries(completions).forEach(([username, data]) => {
+                        logger.info(`User: ${username}, completed: ${data.completed}, overdue: ${data.overdue}, data:`, data);
+                    });
 
                     if (!completions || Object.keys(completions).length === 0) {
                         logger.warn('No completion data found');
@@ -449,17 +403,19 @@ client.on('messageCreate', async(message) => {
                             return true;
                         })
                         .map(([username, data]) => {
-                            const score = (data.completed * 5) - (data.overdue * 6);
+                            const completed = Number(data.count) || 0;
+                            const overdue = Number(data.overdue) || 0;
+                            const score = (completed * 5) - (overdue * 6);
                             logger.info(`User ${username} score calculation:`, {
-                                completed: data.completed,
-                                overdue: data.overdue,
-                                score: score
+                                completed,
+                                overdue,
+                                score
                             });
                             return {
                                 username,
                                 score,
-                                completed: data.completed,
-                                overdue: data.overdue
+                                completed,
+                                overdue
                             };
                         });
 
@@ -533,6 +489,99 @@ client.on('messageCreate', async(message) => {
                 }
                 break;
 
+            case 'add':
+                try {
+                    const allowedRoles = process.env.ALLOWED_ADD_ROLES ?
+                        process.env.ALLOWED_ADD_ROLES.split(',').map(role => role.trim()) : ['Cốt đơ', 'Mod ngầm', 'Boss'];
+
+                    const member = message.member;
+                    const hasPermission = member.roles.cache.some(role =>
+                        allowedRoles.includes(role.name)
+                    );
+
+                    if (!hasPermission) {
+                        await message.reply(`❌ Bạn không có quyền sử dụng lệnh này! Chỉ người có role ${allowedRoles.join(', ')} mới được phép.`);
+                        return;
+                    }
+
+                    const input = args.join(' ');
+                    let cleanInput = input;
+
+                    // Remove 'end.' or 'end' from the end of the input string
+                    const lowerInput = cleanInput.toLowerCase();
+                    if (lowerInput.endsWith(' end.')) {
+                        cleanInput = cleanInput.substring(0, cleanInput.length - ' end.'.length).trim();
+                    } else if (lowerInput.endsWith(' end')) {
+                        cleanInput = cleanInput.substring(0, cleanInput.length - ' end'.length).trim();
+                    }
+
+                    // Log cleanInput
+                    logger.debug('Add command - Cleaned input:', cleanInput);
+
+                    // If the input was just "end." (after args.shift for command)
+                    if (cleanInput.length === 0 && input.toLowerCase().trim() === "end.") {
+                        await message.reply('🤔 Không có deadline nào được thêm. Vui lòng kiểm tra lại cú pháp.\n\n`Sunsine-v1, được tạo bởi bruise_undead, Alpha Tauri Team ©`');
+                        return;
+                    }
+
+                    const deadlineEntries = cleanInput.split('/').map(entry => entry.trim()).filter(entry => entry.length > 0);
+
+                    // Log deadlineEntries
+                    logger.debug('Add command - Deadline entries:', deadlineEntries);
+
+                    const addedTasks = [];
+                    const failedTasks = [];
+
+                    for (const entry of deadlineEntries) {
+                        // Log each entry
+                        logger.debug('Add command - Processing entry:', entry);
+
+                        // Regex để khớp tên-deadline (có thể có khoảng trắng), dd-mm-yy, và discord_username (có thể có #discriminator)
+                        const match = entry.match(/^(.*?)\s+(\d{2}-\d{2}-\d{2})\s+([^\s#]+(?:#[0-9]{4})?)$/);
+
+                        // Log the match result
+                        logger.debug('Add command - Match result:', match);
+
+                        if (match && match.length === 4) {
+                            let taskName = match[1].trim();
+                            const deadlineDateStr = match[2].trim();
+                            const username = match[3].trim();
+
+                            // Chuyển đổi dd-mm-yy sang yyyy-mm-dd
+                            const [day, month, year] = deadlineDateStr.split('-');
+                            const fullYear = `20${year}`; // Giả sử năm 2 chữ số là của thế kỷ 21
+                            const formattedDeadline = `${fullYear}-${month}-${day}`;
+
+                            const success = await addTask(taskName, formattedDeadline, username);
+                            if (success) {
+                                addedTasks.push(`"${taskName}" (hết hạn: ${deadlineDateStr}, cho: ${username})`);
+                            } else {
+                                failedTasks.push(`"${taskName}"`);
+                            }
+                        } else {
+                            failedTasks.push(`\`${entry}\` (không đúng cú pháp)`);
+                        }
+                    }
+
+                    let replyMessage = '';
+                    if (addedTasks.length > 0) {
+                        replyMessage += `✅ Đã thêm các deadline sau vào Sheet 1:\n${addedTasks.join('\n\n')}\n\n`;
+                    }
+                    if (failedTasks.length > 0) {
+                        replyMessage += `❌ Không thể thêm các deadline sau (sai cú pháp hoặc lỗi):\n${failedTasks.join('\n\n')}\n\n`;
+                    }
+                    if (addedTasks.length === 0 && failedTasks.length === 0) {
+                        replyMessage += '🤔 Không có deadline nào được thêm. Vui lòng kiểm tra lại cú pháp.\n\n';
+                    }
+                    replyMessage += '`Sunsine-v1, được tạo bởi bruise_undead, Alpha Tauri Team ©`';
+                    await message.reply(replyMessage);
+
+                } catch (error) {
+                    logger.error('Error in add command:', error);
+                    await message.reply('❌ Có lỗi khi thêm deadline! Vui lòng thử lại sau. 🤖💨\n\n`Sunsine-v1, được tạo bởi bruise_undead, Alpha Tauri Team ©`');
+                }
+                break;
+
             default:
                 console.log('Unknown command:', command);
                 logger.warn(`Unknown command: ${command}`);
@@ -569,8 +618,6 @@ client.login(process.env.DISCORD_TOKEN).catch(error => {
 // Handle process exit
 process.on('exit', () => {
     logger.info('Bot shutting down');
-    // Perform final memory cleanup
-    optimizeMemory();
 });
 
 // Handle uncaught exceptions
@@ -583,7 +630,10 @@ process.on('uncaughtException', (error) => {
         memoryUsage: process.memoryUsage(),
         uptime: process.uptime()
     });
-    // Try to optimize memory before exiting
-    optimizeMemory();
     process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    logger.error('Unhandled Promise Rejection:', { reason, promise });
 });
