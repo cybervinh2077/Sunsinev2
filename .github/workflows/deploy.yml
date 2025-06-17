@@ -17,3 +17,4 @@ jobs:
           script: |
             cd /home/orangepi/Sunsinev2
             ./update.sh 
+            
