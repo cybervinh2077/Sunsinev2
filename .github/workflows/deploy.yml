@@ -15,5 +15,5 @@ jobs:
           username: ${{ secrets.ORANGE_PI_USERNAME }}
           key: ${{ secrets.ORANGE_PI_SSH_KEY }}
           script: |
-            cd /path/to/your/bot
+            cd /home/orangepi/Sunsinev2
             ./update.sh 
